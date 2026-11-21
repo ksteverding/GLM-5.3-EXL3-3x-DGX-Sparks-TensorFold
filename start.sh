@@ -203,8 +203,8 @@ mem_now() { awk '/^MemAvailable:/ { printf "%.1f", $2 / 1048576 }' /proc/meminfo
 memplan() {  # <rank=GiB,...>: the plan's table; non-zero when a rank would fall under FLOOR_GIB
   local snapdir
   snapdir=$SNAP
-  docker run --rm --network none --memory 3g --entrypoint python -v "$snapdir:/ckpt:ro" -v "$PWD/scripts:/recipe:ro" "$IMAGE" \
-    /recipe/memplan.py /ckpt --tp 3 --context "$(arg_value --context)" --kv "$KV" --dense "$DENSE" --mtp "$MTP" \
+  docker run --rm --network none --memory 3g --entrypoint python -v "$HF_CACHE:$HF_CACHE:ro" -v "$PWD/scripts:/recipe:ro" "$IMAGE" \
+    /recipe/memplan.py "$snapdir" --tp 3 --context "$(arg_value --context)" --kv "$KV" --dense "$DENSE" --mtp "$MTP" \
     --prefill-rows "$PREFILL_ROWS" --split "$PREFILL_SPLIT" --cp "$([[ "$CP" == 1 ]] && echo 3 || echo 1)" --kept-gib "$KV_POOL_GIB" --floor "$FLOOR_GIB" \
     --overhead "$OVERHEAD_GIB" --reserve "$MEMORY_RESERVE_GIB" --avail "$1" 2>&1 | grep -v -E '^$|^=+$|PyTorch|Copyright|rights reserved|NVIDIA|found at|CUDA|SHMEM|docker run|insufficient'
   return "${PIPESTATUS[0]}"
@@ -271,6 +271,10 @@ GUARD_DIR="$STATE_DIR/guard"
 # stay). They are root's files (the containers write them), so a throwaway container removes them.
 PCACHE_CLEAN='for d in /k/*/pcache; do [ -d "$d" ] || continue; [ "$d" = "/k/$0/pcache" ] && continue; du -sm "$d" | cut -f1; rm -rf "$d"; done'
 clean_pcaches() {
+  if [[ "${KEEP_OLD_PCACHES:-0}" == 1 ]]; then
+    log "Preserving previous images' prompt caches"
+    return 0
+  fi
   local mb i
   (( DRY )) && { printf '[dry-run] prompt caches of other images removed on every Spark (KERNEL_CACHE/<other hash>/pcache)\n'; return 0; }
   mb=$(docker run --rm --network none -v "$KERNEL_CACHE":/k --entrypoint sh "$IMAGE" -c "$PCACHE_CLEAN" "$KCACHE" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')

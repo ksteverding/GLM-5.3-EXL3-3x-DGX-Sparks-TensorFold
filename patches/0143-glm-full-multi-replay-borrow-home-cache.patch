@@ -1,0 +1,197 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -910,6 +910,10 @@
+             else:
+                 graphs_code = int(os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0")
+             draft_graphs_code = int(os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0")
++            if cfg.full:
++                # Keep the existing setting word: bit 0 is draft graphs, bits 1–2 are full-model opt-ins.
++                draft_graphs_code |= (int(os.environ.get("TF_GLM_MULTI_DRAFT_BORROW") == "1") << 1
++                                      | int(os.environ.get("TF_GLM_MULTI_KEEP_HOME_CACHE") == "1") << 2)
+             verify_code = ([verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
+                            + [graphs_code, draft_graphs_code])
+         else:
+@@ -938,7 +942,8 @@
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TF_GLM_MULTI_GRAPHS, TF_GLM_MULTI_DRAFT_GRAPHS, "
++                               "TF_GLM_MULTI_GRAPHS, TF_GLM_MULTI_DRAFT_GRAPHS, TF_GLM_MULTI_DRAFT_BORROW, "
++                               "TF_GLM_MULTI_KEEP_HOME_CACHE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_DISK_CACHE, TF_GLM_CP_RAW_Q, "
+                                "TF_GLM_CP_PARTS_EDGE, TF_GLM_CP_KV_GATHER): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -232,6 +232,30 @@
+     return drafts
+ 
+ 
++def borrow_spare(drafts: list[list[int]], copied: list[bool], cap: int, turn: int) -> tuple[list[list[int]], list[int]]:
++    """Keep the original window for each stream. Use leftover verify rows for longer learned proposals."""
++    count = len(drafts)
++    share = cap // count - 1
++    ordinary = trim([chain if copy else chain[:share] for chain, copy in zip(drafts, copied)], cap)
++    lengths = [len(chain) for chain in ordinary]
++    before = lengths.copy()
++    left = cap - count - sum(lengths)
++    # Rotate who gets a contested row. Append only to prefixes, preserving both copying and the keyed draws.
++    while left > 0:
++        added = 0
++        for offset in range(count):
++            i = (turn + offset) % count
++            if not copied[i] and lengths[i] < len(drafts[i]):
++                lengths[i] += 1
++                left -= 1
++                added += 1
++                if not left:
++                    break
++        if not added:
++            break
++    return [chain[:n] for chain, n in zip(drafts, lengths)], before
++
++
+ def _f64(x: float) -> list[int]:
+     import struct
+ 
+@@ -457,11 +481,16 @@
+             if not latent.ENABLED:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
+-        self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
++        self.grouped = {"chunks": 0, "pieces": 0, "rows": 0, "replay_overtakes": 0}  # rank 0, for /health
++        self.replay_promoted = False
+         # full GLM-5.3 (glm_moe_dsa): no KDA states, DSpark drafts (a context per stream), the batched verify
+         # (``full_seg.FullSegVerify``, CUDA graphs a window shape; at most FULL_MAX_ROWS rows a round, every stream's)
+         self.full = bool(self.w.cfg.full)
+         self.window_rows = FULL_MAX_ROWS if self.full else MAX_WINDOW
++        self.borrow = ({"rounds": 0, "offered": 0, "accepted": 0}
++                       if self.full and os.environ.get("TF_GLM_MULTI_DRAFT_BORROW") == "1" else None)
++        self.home_cache = ({"moves": 0, "rows": 0, "deferred_rounds": 0}
++                           if self.full and os.environ.get("TF_GLM_MULTI_KEEP_HOME_CACHE") == "1" else None)
+         if self.full and int(self.w.meta.get("cp", 1)) > 1:
+             raise ValueError("context parallelism (TF_GLM_CP=1) serves one request at a time: --parallel 1")
+         self.drafts = drafts
+@@ -578,6 +607,8 @@
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+                 "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                **({"draft_borrow": dict(self.borrow)} if self.borrow is not None else {}),
++                **({"home_cache": dict(self.home_cache)} if self.home_cache is not None else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -1164,12 +1195,25 @@
+                 return None
+             self.credit -= 1
+         s = next_fill([l.s for l in filling])
+-        return self.lanes[s.sid]
++        lane = self.lanes[s.sid]
++        if self.full and self.group:
++            # A whole-prompt cache hit is a zero-row FILL from saved logits, not a piece of a mixed chunk.
++            # Let one foreground replay pass a fresh foreground prompt, then give normal fills their turn.
++            if not self.replay_promoted and not s.background and lane.head is None:
++                replay = next((l for l in filling if not l.s.background and not l.s.done and l.head is not None), None)
++                if replay is not None:
++                    self.replay_promoted = True
++                    self.grouped["replay_overtakes"] += 1
++                    return replay
++            self.replay_promoted = False
++        return lane
+ 
+     def _iterate(self) -> list[Stream]:
+-        if self.fill_budget:
++        if self.fill_budget or (self.full and self.group):
+             cancelled = []
+             for lane in self.lanes.values():
++                if not self.fill_budget and lane.head is None:
++                    continue
+                 poll = getattr(lane.s.emit, "cancelled", None)
+                 if not lane.decoding and not lane.s.done and poll is not None and poll():
+                     lane.s.done = True
+@@ -1315,8 +1359,8 @@
+         return done
+ 
+     def _home(self, lane: Lane) -> bool:
+-        """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
+-        kept prompts in the way evicted and its extent MOVEd); True once it is there."""
++        """Rank 0: move a lone stream to slot 0, base 0 for one-stream graphs. Optionally relocate kept prompts
++        before the active stream, or continue on the segmented graphs if there is no spare extent."""
+ 
+         if self.e.graphed(lane.st):
+             return True
+@@ -1325,6 +1369,22 @@
+             self._reslot(lane, 0)
+         x = lane.extent
+         if x.base != 0:
++            if self.home_cache is not None:
++                # Keep past conversations when a lone stream switches to its faster base-zero graphs.
++                # Move idle extents into disjoint free rows first, using the same rank protocol as compaction.
++                for y in list(self.pool.extents):
++                    if y is x or y.base >= x.size:
++                        continue
++                    dst = next((base + size - y.size for base, size in reversed(self.pool.gaps())
++                                if size >= y.size and base + size - y.size >= x.size), None)
++                    if y.owner is not None or dst is None:
++                        self.home_cache["deferred_rounds"] += 1
++                        return False     # the segmented verifier works at the stream's current base
++                    rows = self._used(y)
++                    self._emit(MOVE, [y.eid, dst, y.size])
++                    self._move(y, dst, y.size)
++                    self.home_cache["moves"] += 1
++                    self.home_cache["rows"] += rows
+             for c in list(self.kept):                  # kept prompts in [0, x.size) make way
+                 y = c.extent
+                 if y is not x and y.base < x.size and c in self.kept:
+@@ -1543,11 +1603,15 @@
+         # full GLM-5.3: every stream's window in one batched verify of at most FULL_MAX_ROWS rows, so each stream drafts
+         # at most its share (2 streams: 7, 3: 4, 4: 3); ``trim`` still cuts copied drafts to the round's rows
+         share = max(0, self.window_rows // max(1, len(lanes)) - 1) if self.full else None
++        borrow = self.borrow if len(lanes) > 1 and not short else None
+         for l in lanes:
+             c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and not short else []
+             copied.append(bool(c))
+             drafts.append(list(c))
+-            depth = l.depth if share is None else min(l.depth, share)
++            depth = l.depth
++            # The cost policy can choose a different short prefix when offered more candidates.
++            if share is not None and (borrow is None or getattr(l.policy, "round_ms", None) is not None):
++                depth = min(depth, share)
+             if not short and not c and l.dflash and depth > 0:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+@@ -1560,7 +1624,12 @@
+             got = self.drafts.propose([a for _, a in asks])
+             for (k, _), d in zip(asks, got):
+                 drafts[k] = list(d)
+-        drafts = trim(drafts, self.window_rows)
++        ordinary = None
++        if borrow is None:
++            drafts = trim(drafts, self.window_rows)
++        else:
++            drafts, ordinary = borrow_spare(drafts, copied, self.window_rows, borrow["rounds"])
++            borrow["rounds"] += 1
+         if prof is not None:
+             prof.mark("propose")
+         segments = []
+@@ -1603,6 +1672,10 @@
+             keeps.append(keep)
+         if prof is not None:
+             prof.mark("accept")
++        if ordinary is not None:
++            for seg, keep, base in zip(segments, keeps, ordinary):
++                borrow["offered"] += max(0, len(seg.tokens) - 1 - base)
++                borrow["accepted"] += max(0, keep - 1 - base)
+         verify.commit(segments, keeps)
+         if prof is not None:
+             prof.mark("commit")
+@@ -1673,6 +1746,7 @@
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
+             self.decode_due = self.short_round_due = False
++            self.replay_promoted = False
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True

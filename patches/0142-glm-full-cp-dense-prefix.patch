@@ -1,0 +1,55 @@
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -1444,15 +1444,20 @@
+             b.topk = cp_kvg_all_visible(b, R, host_pos, G, S, k, dev)
+     elif ix is not None and keys is not None:
+         with prof.timed("dsa: select tokens"):
++            # A chunk that crosses k only needs scores for its suffix. Keep the original query projection shape.
++            dense = max(0, k - int(host_pos)) if c.dense_limit <= k else 0
++            n = R - dense
+             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+-            dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
++            qi = b.qi[dense:R]
++            at = pos_dev + dense if dense else pos_dev
++            dsa_full.index_q_rope(qi, c.index_heads, at, freq)
+             cols = max(1, dcp.visible_local(host_pos + R - 1, rank, G))
+-            M = dcp.owner_rows(R, G)
++            M = dcp.owner_rows(n, G)
+             cand = torch.empty((G * M, k), dtype=torch.int64, device=dev)
+-            if G * M > R:
+-                cand[R:].zero_()                      # pad rows: no candidates (an empty list, never read)
+-            dcp.select_local(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rank, G, pos_dev, R, k=k, cols=cols,
+-                             out=cand[:R])
++            if G * M > n:
++                cand[n:].zero_()                      # pad rows: no candidates (an empty list, never read)
++            dcp.select_local(qi, b.ikr[dense:R, c.index_dim:], keys, rank, G, at, n, k=k, cols=cols,
++                             out=cand[:n])
+             every = torch.empty((G, M, k), dtype=torch.int64, device=dev)
+             every[rank].copy_(cand[rank * M:(rank + 1) * M])
+             peers = [p for p in range(G) if p != rank]
+@@ -1462,12 +1467,20 @@
+             th = torch.empty((M,), dtype=torch.int64, device=dev)
+             dcp.select_threshold(every, M, th)
+             own_t, own_c = dcp.owner_lists(every, th, G, S)
+-            all_t = torch.empty((G * M, k), dtype=torch.int32, device=dev)
+-            all_c = torch.empty((G * M,), dtype=torch.int32, device=dev)
++            all_t = torch.empty((dense + G * M, k), dtype=torch.int32, device=dev)
++            all_c = torch.empty((dense + G * M,), dtype=torch.int32, device=dev)
++            if dense:
++                counts = all_c[:dense]
++                counts.copy_(torch.arange(dense, dtype=torch.int32, device=dev) + int(host_pos) + 1)
++                positions = torch.arange(k, dtype=torch.int32, device=dev)
++                prefix = all_t[:dense]
++                prefix.copy_((positions % G) * S + positions // G)
++                # Match owner_lists, including the padding that sparse attention masks out.
++                prefix.masked_fill_(positions[None, :] >= counts[:, None], -1)
+ 
+             def gather_lists() -> None:
+-                gather_all(own_t.reshape(-1), all_t.reshape(-1))
+-                gather_all(own_c, all_c)
++                gather_all(own_t.reshape(-1), all_t[dense:].reshape(-1))
++                gather_all(own_c, all_c[dense:])
+ 
+             side.wait(side.run(gather_lists))
+             b.topk = (all_t[:R], all_c[:R])

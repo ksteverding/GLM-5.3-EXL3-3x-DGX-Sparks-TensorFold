@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This is a fork.** This repository is a modified copy of [MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold) (commit `eb6414b`), the original work of Mia's AI Lab and its contributors. It is not maintained or endorsed by them. The README below is the original, unchanged. For what this fork adds or changes, see [`CHANGES-FROM-UPSTREAM.md`](CHANGES-FROM-UPSTREAM.md). Report problems with the fork's additions here, not upstream.
+
 <h1 align="center">GLM-5.3 EXL3 on DGX Sparks with TensorFold</h1>
 
 <p align="center">

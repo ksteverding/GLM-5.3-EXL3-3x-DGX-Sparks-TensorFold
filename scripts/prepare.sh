@@ -179,12 +179,12 @@ fi
 
 # ---------------------------------------------------------------- 4. check it (CPU only, no GPU)
 log "Checking the checkpoint with the patched engine's config reader"
-docker run --rm --network none --memory 4g --entrypoint python -v "$SNAP:/ckpt:ro" "$IMAGE" -c '
-import sys
+docker run --rm --network none --memory 4g --entrypoint python -v "$HF_CACHE:$HF_CACHE:ro" -e CHECKPOINT="$SNAP" "$IMAGE" -c '
+import os, sys
 from tensorfold.families import glm_moe_dsa
 from tensorfold.families.glm5_next.cuda.weights import Config
-glm_moe_dsa.check("/ckpt")
-c = Config.read("/ckpt")
+glm_moe_dsa.check(os.environ["CHECKPOINT"])
+c = Config.read(os.environ["CHECKPOINT"])
 assert c.full and c.layers == 78 and c.quant == "exl3", (c.full, c.layers, c.quant)
 n = sum(k == "full" for k in c.index_kinds)
 print(f"GLM-5.3: {c.layers} layers + MTP, {c.experts} routed experts, {n} indexer layers")
