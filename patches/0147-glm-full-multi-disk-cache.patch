@@ -1,0 +1,402 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6b8675e..06a8a98 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -927,8 +927,10 @@ class GlmEngine:
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), self.cp, int(cp_raw_q), int(CP_PARTS_EDGE),
+                                  int(CP_KV_GATHER)]
+-        # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
+-        disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
++        # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none; one
++        # request at a time (``_disk_resume``), or full GLM-5.3's --parallel scheduler (``multi.MultiDecoder``)
++        disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off"))
++                      and (parallel == 1 or cfg.full))
+         mine.append(disk_on)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index 2f82e03..c9d97ef 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -24,7 +24,7 @@ are balanced within the budget without adding rounds; GPU layer cost, finalizati
+ learned separately so extra slices cannot inflate every layer cost.
+ 
+ Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
+-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH, IDLE, which both ranks apply
++ONE message (``GlmEngine._share``; two when an admission loads a prompt state from disk, DISK): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH, IDLE, DISK, which both ranks apply
+ in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths rank 0
+ sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
+ ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
+@@ -41,7 +41,15 @@ rows, so each stream drafts at most its share (16 // streams - 1) and ``trim`` c
+ (``dspark_multi.DSparkMulti``: a context a stream over one weight set, proposals one stream after another, up to the
+ speculator's 8 drafts, each context's block pass and updates as CUDA graphs; auto requests take
+ TF_GLM_DSPARK_MULTI_POLICY); multi-prompt chunks through ``multi_prefill.PieceMixer``'s full GLM split. The multi-stream
+-graphs share the engine's graph pool. A lone stream still moves home to the one-stream graphs."""
++graphs share the engine's graph pool. A lone stream still moves home to the one-stream graphs.
++
++Full GLM-5.3's kept prompts also go to each rank's disk (TF_GLM_DISK_CACHE, ``pcache.DiskCache``, as one request at a
++time keeps its states): written in the background when kept, their rows (and DSpark window) read in place from the
++pool. A move of their extent gives the write up and starts it again from the new rows; a drop (an eviction) waits for
++it first (TF_GLM_DISK_EVICT_WAIT_S). A drafted text request whose longest kept prefix in memory is shorter than one on
++rank 0's disk gets a fresh extent and the op DISK (rank 0 sends it at once): every rank reads its own file of that
++prefix into the extent, and only when every rank has a sound file (two all-gathers, as ``GlmEngine._disk_resume``) is
++it a kept prompt, which the request then resumes from as from any other; else the extent goes and the files too."""
+ 
+ from __future__ import annotations
+ 
+@@ -64,9 +72,9 @@ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_
+ from .pool import ALIGN, Pool, align_up
+ from .verify import FULL_MAX_ROWS, BatchedVerify, FullBatchedVerify, Segment, SerialVerify, Verified
+ 
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART = range(1, 13)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART, DISK = range(1, 14)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART"}
++       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART", DISK: "DISK"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -568,6 +576,8 @@ class MultiDecoder:
+         self.sent = self.received = 0                     # messages sealed on rank 0, unsealed on rank 1
+         self.lanes: dict[int, Lane] = {}                 # by sid, in admission order
+         self.kept: list = []                             # kept prompts (decode.Snapshot + kid, extent), oldest first
++        # TF_GLM_DISK_CACHE: kept prompts on this rank's disk too (full GLM-5.3; the engine's ``pcache.DiskCache``)
++        self.disk = getattr(engine, "disk", None) if self.full else None
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.outbox: list[int] = []
+         self.idle = True
+@@ -609,6 +619,7 @@ class MultiDecoder:
+                 "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
+                 **({"draft_borrow": dict(self.borrow)} if self.borrow is not None else {}),
+                 **({"home_cache": dict(self.home_cache)} if self.home_cache is not None else {}),
++                **({"disk_cache": self._disk_health()} if self.disk is not None else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -776,6 +787,8 @@ class MultiDecoder:
+             if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0]
+                                     or not 0 <= p[1] < p[2]):
+                 raise RuntimeError("invalid MFILLPART payload")
++            if op == DISK and (len(p) < 5 or p[3] < 1 or len(p) != 4 + p[3]):
++                raise RuntimeError("invalid DISK payload")
+             ops.append((op, p))
+             i += 2 + n
+         return ops
+@@ -829,6 +842,12 @@ class MultiDecoder:
+         if slot is None:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+         hit = self._resume(key) if draft and key is not None else None
++        loaded = None
++        if draft and s.vision is None and self.disk is not None:      # a longer kept prefix on disk: loaded first
++            t = time.perf_counter()
++            got = self._disk_admit(prompt, hit)
++            if got is not None:
++                hit, loaded = got, (len(got.ids), time.perf_counter() - t)
+         encoded_from = len(hit.ids) if hit is not None else 0
+         if s.vision is not None:              # encoded before anything is sent: a failure stops here
+             feed = self._encode(s.vision, encoded_from)
+@@ -878,6 +897,9 @@ class MultiDecoder:
+             self.broken = exc
+             raise
+         self.lanes[sid].key = key
++        if loaded is not None:
++            s.glm_lane = dict(getattr(s, "glm_lane", None) or {}, disk_cached=loaded[0],
++                              disk_load_s=round(loaded[1], 3))
+ 
+     def _encode(self, prepared, cut: int):
+         """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
+@@ -1050,10 +1072,15 @@ class MultiDecoder:
+         self.kept.append(snap)
+         while len(self.kept) > max(1, self.g.cache_entries):
+             self._drop(cap_victim(self.kept))
++        if snap in self.kept:
++            self._disk_put(snap, lane.st)
+ 
+     def _drop(self, c) -> None:
+-        """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
++        """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept. Its disk
++        write, if still going, ends first (or is given up after TF_GLM_DISK_EVICT_WAIT_S): its rows may change next."""
+ 
++        if self.disk is not None:
++            self.disk.give_up([c.kid], self.disk.evict_s)
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+@@ -1078,6 +1105,117 @@ class MultiDecoder:
+         self._emit(EVICT, [c.kid])
+         self._drop(c)
+ 
++    # -- the disk tier (TF_GLM_DISK_CACHE, ``pcache``) ----------------------------------------------------------------------
++    def _view(self, x):
++        """A state viewing extent x's rows (slot 0's views, only read): what a kept prompt's rows are read through."""
++        from .forward import State
++
++        return State(self.w, x.size, self.e.rows, caches=self.e.caches, base=x.base, slots=self.e.slots, slot=0)
++
++    def _disk_put(self, c, st) -> None:
++        """Both ranks: kept prompt c to this rank's disk in the background (its rows read in place through ``st``, a
++        state viewing its extent); not a prompt with pictures (its ids alone do not name its rows)."""
++
++        if self.disk is None or c.images:
++            return
++        prev = self.e.use(st)
++        try:
++            self.disk.submit(self.e, c, drafter=None, tag=c.kid)
++        finally:
++            self.e.use(prev)
++
++    def _disk_admit(self, prompt: list[int], hit):
++        """Rank 0: the longest saved prefix of ``prompt`` on disk, when it is longer than ``hit`` (the longest kept
++        one) and fits as ``_resume`` asks (DSpark's window with drafts, the grid, a head row for the whole prompt),
++        loaded on every rank into a fresh extent of the request's size (``_disk_load``); the new kept prompt, or None."""
++
++        d = self.disk
++        least, total = (len(hit.ids) if hit is not None else 0), len(prompt)
++
++        def fits(entry) -> bool:
++            n = int(entry["n"])
++            return (n > least and (self.drafts is None or bool(entry.get("drafter")))
++                    and not (self.grid and n % self.grid) and (n < total or (n == total and bool(entry.get("head")))))
++
++        best = d.lookup(prompt, fits)
++        if best is None:
++            d.stats["misses"] += 1
++            return None
++        size = self._need(total)
++        base = self._room(size, [hit.extent] if hit is not None else [])
++        if base is None:
++            return None
++        n = int(best["n"])
++        self._emit(DISK, [self.next_kid, base, size, n, *prompt[:n]])
++        self._flush()                    # the followers join the load's all-gathers now, as rank 0 does
++        try:
++            return self._disk_load(self.next_kid, base, size, list(prompt[:n]))
++        except Exception as exc:         # the followers load the same DISK: the ranks may no longer agree
++            self.broken = exc
++            raise
++
++    def _disk_load(self, kid: int, base: int, size: int, ids: list[int]):
++        """Both ranks (DISK): the state of ``ids`` from this rank's file into a new extent [base, base + size), kept
++        prompt ``kid``, when every rank has a sound file of it: two all-gathers of ok flags, after the headers and after
++        the rows (every piece checksummed). Otherwise the extent goes and every rank forgets its file. Returns the kept
++        prompt or None."""
++
++        from .pcache import PCacheError, load_snapshot
++
++        if kid != self.next_kid:
++            raise RuntimeError(f"rank {self.rank}: a DISK load as kept prompt {kid}, the next here is {self.next_kid}")
++        d = self.disk
++        meta, why = None, ""
++        try:
++            if d is None:
++                raise PCacheError("no disk tier on this rank")
++            meta = d.check(ids)
++        except Exception as err:          # noqa: BLE001  (any failure is a miss: the ranks must still agree)
++            meta, why = None, str(err) if isinstance(err, PCacheError) else repr(err)
++        if min(r[0] for r in self.g._gather_ints([int(meta is not None)])) == 0:
++            self._disk_forget(ids, why or "another rank's file")
++            return None
++        x = self.pool.add(base, size)
++        snap = None
++        prev = self.e.use(self._view(x))
++        try:
++            snap = load_snapshot(d, self.e, ids, meta, drafter=None, live=True)
++            if self.drafts is not None and (snap.drafter_end != len(ids) or snap.drafter_rows is None):
++                raise PCacheError("no DSpark window")
++        except Exception as err:          # noqa: BLE001
++            snap, why = None, str(err) if isinstance(err, PCacheError) else repr(err)
++        finally:
++            self.e.use(prev)
++        if min(r[0] for r in self.g._gather_ints([int(snap is not None)])) == 0:
++            self.pool.remove(x)
++            self._disk_forget(ids, why or "another rank's file")
++            return None
++        snap.kid = kid
++        self.next_kid += 1
++        snap.extent = x
++        snap.key = snap.ids if self.rank == 0 else None
++        snap.images = snap.shared = False
++        x.kept.append(snap)
++        self.kept.append(snap)
++        d.touch(d.key(ids))
++        d.stats["hits"] += 1
++        while len(self.kept) > max(1, self.g.cache_entries):
++            self._drop(cap_victim(self.kept))
++        return snap
++
++    def _disk_forget(self, ids: list[int], why: str) -> None:
++        d = self.disk
++        if d is None:
++            return
++        d.remove(d.key(ids))
++        if self.rank == 0 or why != "another rank's file":
++            print(f"[tensorfold] rank {self.rank}: the saved state of {len(ids)} tokens is not used ({why})",
++                  flush=True)
++
++    def _disk_health(self) -> dict:
++        d = self.disk
++        return {"states": len(d.entries), "gib": round(d.held() / 2 ** 30, 2), **d.stats}
++
+     # -- room --------------------------------------------------------------------------------------------------------------
+     def _used(self, x) -> int:
+         used = max([len(k.ids) for k in x.kept], default=0)
+@@ -1088,13 +1226,19 @@ class MultiDecoder:
+         return used
+ 
+     def _move(self, x, base: int, size: int) -> None:
+-        """Both ranks: relocate extent x (its used rows copied) to [base, base + size)."""
++        """Both ranks: relocate extent x (its used rows copied) to [base, base + size). Disk writes still reading its
++        kept prompts' rows are given up first and started again from the new rows."""
+ 
++        lost = self.disk.give_up([c.kid for c in x.kept]) if self.disk is not None else 0
+         used = self._used(x)
+         old = self.pool.move(x, base, size)
+         self.arena.copy(old, base, used)
+         if x.owner is not None:
+             self.lanes[x.owner].st.bind(x.base, x.size)
++        if lost:
++            st = self.lanes[x.owner].st if x.owner is not None else self._view(x)
++            for c in list(x.kept):
++                self._disk_put(c, st)
+ 
+     def _resize(self, x, size: int) -> None:
+         self.pool.resize(x, size)
+@@ -1905,6 +2049,8 @@ class MultiDecoder:
+                 self._reslot(self.lanes[p[0]], p[1])
+             elif op == FINISH:
+                 self._finish(p[0])
++            elif op == DISK:
++                self._disk_load(p[0], p[1], p[2], p[4:4 + p[3]])
+             elif op == IDLE:
+                 if self.lanes:
+                     raise RuntimeError(f"rank 1 holds {len(self.lanes)} streams rank 0 has finished")
+diff --git tensorfold/families/glm5_next/cuda/pcache.py tensorfold/families/glm5_next/cuda/pcache.py
+index ff21dee..a181e32 100644
+--- tensorfold/families/glm5_next/cuda/pcache.py
++++ tensorfold/families/glm5_next/cuda/pcache.py
+@@ -26,7 +26,11 @@ file system takes one (buffered otherwise); a piece is checksummed as it passes
+ floor (TF_GLM_DISK_KEEP_FREE_GB, default 100: a write that would leave less free evicts or is skipped), least recently
+ used first out; a background ``Writer`` (bounded queue) so a request never waits for the disk. The longest saved prefix
+ of a prompt: the entries' token counts at most the prompt's, the prompt's sha256 taken incrementally at each of them
+-(one pass over its ids), the longest whose digest matches and whose fields fit the request."""
++(one pass over its ids), the longest whose digest matches and whose fields fit the request.
++
++Full GLM-5.3 under --parallel (``multi.MultiDecoder``) writes its kept prompts the same way, their rows read in place
++from the pool; a write is named by its kept prompt (``Job.tag``), so a kept prompt whose extent moves or goes can
++wait for its write or give it up (``DiskCache.give_up``)."""
+ 
+ from __future__ import annotations
+ 
+@@ -251,10 +255,13 @@ def _header_bytes(meta: dict) -> bytes:
+ 
+ class Job:
+     """One state to write: its key, header fields and sections; ``ready``: a CUDA event the sections' producers
+-    recorded (the writer's stream waits on it); ``cancel``: set by a fence (its rows are about to change)."""
++    recorded (the writer's stream waits on it); ``cancel``: set by a fence (its rows are about to change); ``tag``:
++    the caller's name for the state (--parallel: its kept prompt's id, which ``DiskCache.give_up`` names)."""
+ 
+-    def __init__(self, key: str, path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], entry: dict) -> None:
++    def __init__(self, key: str, path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], entry: dict,
++                 tag=None) -> None:
+         self.key, self.path, self.meta, self.tensors, self.entry = key, path, meta, tensors, entry
++        self.tag = tag
+         self.n = int(meta["n"])
+         self.ready = None
+         if any(t.is_cuda for _, t in tensors):
+@@ -552,6 +559,19 @@ class Writer:
+         self.cache.stats["fenced"] += lost
+         return lost
+ 
++    def settle(self, conflicts: Callable[[Job], bool], wait_s: float) -> int:
++        """Let queued or running jobs ``conflicts`` names finish within ``wait_s``, then give up the rest (``fence``).
++        Returns the jobs given up."""
++
++        end = time.monotonic() + max(0.0, wait_s)
++        with self.cv:
++            while (self.current is not None and conflicts(self.current)) or any(conflicts(j) for j in self.q):
++                left = end - time.monotonic()
++                if left <= 0:
++                    break
++                self.cv.wait(timeout=left)
++        return self.fence(conflicts, 0.0)
++
+     def wait_key(self, key: str, timeout: float) -> bool:
+         """Wait (at most ``timeout`` s) while the state ``key`` is queued or being written; True when it no longer is."""
+ 
+@@ -589,7 +609,7 @@ class DiskCache:
+ 
+     def __init__(self, root, identity: str, *, rank: int, world: int, cp: int = 1, kv: str = "bf16",
+                  budget: int = 64 << 30, keep_free: int = 100 * 10 ** 9, threads: int = 8, depth: int = 2,
+-                 direct: bool = True, fence_s: float = 0.0, wait_s: float = 30.0,
++                 direct: bool = True, fence_s: float = 0.0, wait_s: float = 30.0, evict_s: float = 10.0,
+                  log: Callable[[str], None] | None = None) -> None:
+         self.root = Path(root)
+         self.root.mkdir(parents=True, exist_ok=True)
+@@ -597,7 +617,7 @@ class DiskCache:
+         self.rank, self.world, self.cp, self.kv = int(rank), int(world), int(cp), str(kv)
+         self.budget, self.keep_free = int(budget), int(keep_free)
+         self.threads, self.direct, self.fence_s = max(1, int(threads)), bool(direct), float(fence_s)
+-        self.wait_s = float(wait_s)
++        self.wait_s, self.evict_s = float(wait_s), float(evict_s)
+         self.tag = f"w{self.world}r{self.rank}"
+         self.index_path = self.root / f"index.{self.tag}.json"
+         self.lock = threading.RLock()
+@@ -621,7 +641,8 @@ class DiskCache:
+         """TF_GLM_DISK_CACHE=<dir> (off unset); TF_GLM_DISK_CACHE_GIB (64), TF_GLM_DISK_KEEP_FREE_GB (100),
+         TF_GLM_DISK_THREADS (8), TF_GLM_DISK_QUEUE (2), TF_GLM_DISK_DIRECT (1: O_DIRECT where possible),
+         TF_GLM_DISK_FENCE_MS (0: a write whose rows the next request changes is cancelled, not waited for),
+-        TF_GLM_DISK_WAIT_S (30: how long a rank whose own write of a state rank 0 found is still running waits)."""
++        TF_GLM_DISK_WAIT_S (30: how long a rank whose own write of a state rank 0 found is still running waits),
++        TF_GLM_DISK_EVICT_WAIT_S (10, --parallel: how long dropping a kept prompt waits for its write to end)."""
+ 
+         root = os.environ.get("TF_GLM_DISK_CACHE", "").strip()
+         if not root or root in ("0", "off"):
+@@ -632,7 +653,8 @@ class DiskCache:
+                    threads=int(_env_float("TF_GLM_DISK_THREADS", 8)), depth=int(_env_float("TF_GLM_DISK_QUEUE", 2)),
+                    direct=os.environ.get("TF_GLM_DISK_DIRECT", "1").strip() != "0",
+                    fence_s=_env_float("TF_GLM_DISK_FENCE_MS", 0) / 1000,
+-                   wait_s=_env_float("TF_GLM_DISK_WAIT_S", 30), log=log)
++                   wait_s=_env_float("TF_GLM_DISK_WAIT_S", 30),
++                   evict_s=_env_float("TF_GLM_DISK_EVICT_WAIT_S", 10), log=log)
+ 
+     def log(self, text: str) -> None:
+         if self._log is not None:
+@@ -756,9 +778,9 @@ class DiskCache:
+         return best
+ 
+     # -- writing
+-    def submit(self, e, snap, drafter=None) -> bool:
+-        """Queue a kept state for the disk (the request thread): its sections now, the writing in the background.
+-        False when it is already there, queued, or the queue is full."""
++    def submit(self, e, snap, drafter=None, tag=None) -> bool:
++        """Queue a kept state for the disk (the request thread): its sections now, the writing in the background;
++        ``tag``: the job's name for ``give_up``. False when it is already there, queued, or the queue is full."""
+ 
+         digest = ids_digest(snap.ids)
+         key = self.key_of(digest)
+@@ -772,7 +794,7 @@ class DiskCache:
+                     ids_sha256=digest, created=time.time())
+         entry = dict(n=len(snap.ids), ids=digest, identity=self.identity, mtp=fields["mtp_len"] >= 0,
+                      drafter=fields["drafter_end"] == len(snap.ids), ring=fields["drafter_ring"], head=fields["head"])
+-        job = Job(key, self.path(key), meta, tensors, entry)
++        job = Job(key, self.path(key), meta, tensors, entry, tag)
+         ok = self.writer.submit(job)
+         if not ok:
+             self.stats["skipped"] += 1
+@@ -802,6 +824,15 @@ class DiskCache:
+ 
+         return self.writer.fence(lambda j: cut < j.n, self.fence_s)
+ 
++    def give_up(self, tags, wait_s: float = 0.0) -> int:
++        """--parallel: the rows of the states named ``tags`` are about to change or go: their queued or running
++        writes get ``wait_s`` to finish, then are given up. Returns the writes given up."""
++
++        tags = set(tags)
++        if not tags:
++            return 0
++        return self.writer.settle(lambda j: j.tag in tags, wait_s)
++
+     # -- reading
+     def check(self, ids: Sequence[int]) -> dict:
+         """This rank's file of the state of ``ids``: its validated header (or PCacheError)."""

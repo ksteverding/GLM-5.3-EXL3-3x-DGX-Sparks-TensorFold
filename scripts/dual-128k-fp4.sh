@@ -26,7 +26,7 @@ export TF_GLM_MULTI_GRAPHS=top TF_GLM_MULTI_PREFILL=1
 export TF_GLM_FILL_ROWS=${TF_GLM_FILL_ROWS:-1024} TF_GLM_FILL_SHARE=${TF_GLM_FILL_SHARE:-0.5}
 export TF_GLM_MULTI_KEEP_HOME_CACHE=1 TF_GLM_MULTI_DRAFT_BORROW=0
 export TF_GLM_FILL_BUDGET_MS=0 TF_GLM_FILL_DRAFTS=0
-export DISK_CACHE=0 FLOOR_GIB=6 OVERHEAD_GIB=10 MEMORY_RESERVE_GIB=16 GUARD=1 GUARD_KILL_GIB=3
+export DISK_CACHE=${DISK_CACHE:-0} FLOOR_GIB=6 OVERHEAD_GIB=10 MEMORY_RESERVE_GIB=16 GUARD=1 GUARD_KILL_GIB=3
 # Verify windows of 24 rows, for one stream and for both together (0146), so copy drafts run longer; 24-row all-gathers
 # stay on RoCE with TF_ROCE_MAX_KB=512 (16 KiB a row). Replies stay equal to their serial references (tools/exact.py).
 export TF_GLM_MAX_ROWS=${TF_GLM_MAX_ROWS:-24} TF_GLM_MULTI_ROWS=${TF_GLM_MULTI_ROWS:-24} TF_ROCE_MAX_KB=${TF_ROCE_MAX_KB:-512}
@@ -34,6 +34,7 @@ export TF_GLM_MAX_ROWS=${TF_GLM_MAX_ROWS:-24} TF_GLM_MULTI_ROWS=${TF_GLM_MULTI_R
 export TF_GLM_CACHE_ENTRIES=${TF_GLM_CACHE_ENTRIES:-24}
 # Expert usage counters (0144), for the own-quantization work; TF_GLM_EXPERT_COUNTS=0 turns them off
 export TF_GLM_EXPERT_COUNTS=${TF_GLM_EXPERT_COUNTS:-1}
+# DISK_CACHE=1: kept prompts also on each Spark's NVMe (0147), so an evicted or restart-lost prompt loads in seconds
 
 check_image() (
   cd "$recipe"
@@ -57,6 +58,8 @@ required = {
         b"TF_GLM_MULTI_KEEP_HOME_CACHE", b"TF_GLM_MULTI_DRAFT_BORROW",
     )),
 }
+if "@NEED_DISK@" == "1":                  # DISK_CACHE=1 under --parallel needs 0147's disk tier in the scheduler
+    required["multi.py"] = (multi_source, required["multi.py"][1] + (b"_disk_load",))
 for name, (source, features) in required.items():
     missing = [feature.decode() for feature in features if feature not in source]
     if missing:
@@ -64,6 +67,7 @@ for name, (source, features) in required.items():
 print(sha256(multi_source).hexdigest(), sha256(engine_source).hexdigest())
 PY
   )
+  probe=${probe//@NEED_DISK@/$DISK_CACHE}
   image_fingerprint() {
     local image=$1 probe=$2 label hashes
     label=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$image") || return 1

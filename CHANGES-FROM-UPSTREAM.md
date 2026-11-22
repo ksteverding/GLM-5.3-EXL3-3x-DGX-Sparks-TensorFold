@@ -16,6 +16,7 @@ This repository is a fork: a modified copy of [MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Spa
 - `patches/0145-glm-tool-call-stray-tags.patch`: a `<tool_call>` the model writes as text (a mention in its reasoning or answer) no longer swallows the real tool call after it. Before, the reply came back as plain text with the raw call inside and finish reason `stop`, so agent clients ended the task.
 - `patches/0146-glm-full-multi-rows.patch`: `TF_GLM_MULTI_ROWS` sets the parallel verify window (16 by default, up to `TF_GLM_MAX_ROWS`).
 - `tests/cpu/test_expert_counts.py`, `tests/cpu/test_tool_call_stray_tags.py`: CPU tests for 0144 and 0145.
+- `patches/0147-glm-full-multi-disk-cache.patch`: the NVMe prompt cache (`TF_GLM_DISK_CACHE`) also under `--parallel` for full GLM-5.3: kept prompts are written to each Spark's disk in the background, and a prompt that left the pool (evicted, or lost in a restart) loads again in about half a second instead of being read again (a 92k prompt: 0.55 s instead of 157 s). Replies stay bit-exact. CPU tests in `tests/cpu/test_full_multi_disk.py`; the preset turns it on with `DISK_CACHE=1`.
 - `.gitignore` for the machine-local settings files.
 
 ## Modified

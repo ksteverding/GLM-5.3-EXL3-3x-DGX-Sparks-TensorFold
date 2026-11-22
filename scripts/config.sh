@@ -162,7 +162,8 @@ export TF_GLM_COPY_HYBRID="$COPY_HYBRID"
 # again. DISK_CACHE_GIB caps it on each Spark (64: ~5.1M prompt tokens across the three at fp4 with CP=1); the least
 # recently used go first, and a Spark always keeps 100 GB free (TF_GLM_DISK_KEEP_FREE_GB). Stored under
 # KERNEL_CACHE/<image hash>/pcache on each Spark. Prefill measured the same with it (406 vs 410 tok/s at 94k); a 94k
-# prompt resumed in 3.0 s after a restart (boots pcacheA / pcacheB). PARALLEL > 1: unused. DISK_CACHE=0: off.
+# prompt resumed in 3.0 s after a restart (boots pcacheA / pcacheB). PARALLEL > 1: the scheduler's kept prompts too (0147).
+# DISK_CACHE=0: off.
 DISK_CACHE="${DISK_CACHE:-1}"
 DISK_CACHE_GIB="${DISK_CACHE_GIB:-64}"
 if [[ "$DISK_CACHE" == 1 ]]; then

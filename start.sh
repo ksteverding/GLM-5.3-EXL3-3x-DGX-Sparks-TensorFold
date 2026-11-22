@@ -430,7 +430,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
-    Window   $(arg_value --context) tokens · 3 Sparks · $( [[ "$PARALLEL" == 1 ]] && echo "one request at a time" || echo "$PARALLEL at once") · $KV KV$( [[ "$CP" == 1 ]] && echo " · context parallel")$( [[ -n "${TF_GLM_DISK_CACHE:-}" && "$PARALLEL" == 1 ]] && echo " · prompt cache on NVMe (up to ${TF_GLM_DISK_CACHE_GIB:-64} GiB a Spark)") · $DENSE dense weights$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")
+    Window   $(arg_value --context) tokens · 3 Sparks · $( [[ "$PARALLEL" == 1 ]] && echo "one request at a time" || echo "$PARALLEL at once") · $KV KV$( [[ "$CP" == 1 ]] && echo " · context parallel")$( [[ -n "${TF_GLM_DISK_CACHE:-}" ]] && echo " · prompt cache on NVMe (up to ${TF_GLM_DISK_CACHE_GIB:-64} GiB a Spark)") · $DENSE dense weights$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")
     Drafts   $DRAFTER$( [[ "$MTP" == 1 && "$DRAFTER" != mtp ]] && echo " + MTP") · copy drafts $( [[ "$COPY" == 1 ]] && echo "up to $COPY_MAX$( [[ "$COPY_HYBRID" == 1 ]] && echo ", checked by DSpark")" || echo off) · shared system prompts $( [[ "$SHARED_PREFIX" == 1 ]] && echo on || echo off)
     Memory   guard $( [[ "$GUARD" == 1 ]] && echo "on (stops a rank below $GUARD_KILL_GIB GiB; lowest so far: $STATE_DIR/guard/memguard.low)" || echo off)
     Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)

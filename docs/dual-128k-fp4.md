@@ -1,6 +1,6 @@
 # Two 128K FP4 slots on three DGX Sparks
 
-This preset gives each of two simultaneous requests 131,072 tokens for its prompt and reply combined. It uses FP4 KV, Q4 dense weights, DSpark and grouped prefill. A full prompt chunk has 3,072 rows (PREFILL_ROWS; measured 2026-11-21: cold prompts ~15% faster than 1,024 rows, about 2.1 GiB more a rank, lowest free 10.9 GiB under load). While another request decodes, the scheduler processes 1,024 prompt rows per turn and gives prefill half of its turns (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE; measured 2026-11-21 with a 27.6k-token prompt arriving beside a 2,500-token reply: 512 rows at 0.25 gave a first token after 79.8 s and both done at 129.7 s; 1,024 at 0.5 gave 53.5 s and 118.6 s with pauses under 2.3 s; 3,072 at 1 gave 43.5 s and 111.2 s but paused the other reply for 43 s). The preset enables retained-cache relocation and keeps draft borrowing, sliced prefill and NVMe prompt caching off. Admission uses a 16 GiB reserve, including a 6 GiB free-memory target. The runtime guard stops a rank below 3 GiB.
+This preset gives each of two simultaneous requests 131,072 tokens for its prompt and reply combined. It uses FP4 KV, Q4 dense weights, DSpark and grouped prefill. A full prompt chunk has 3,072 rows (PREFILL_ROWS; measured 2026-11-21: cold prompts ~15% faster than 1,024 rows, about 2.1 GiB more a rank, lowest free 10.9 GiB under load). While another request decodes, the scheduler processes 1,024 prompt rows per turn and gives prefill half of its turns (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE; measured 2026-11-21 with a 27.6k-token prompt arriving beside a 2,500-token reply: 512 rows at 0.25 gave a first token after 79.8 s and both done at 129.7 s; 1,024 at 0.5 gave 53.5 s and 118.6 s with pauses under 2.3 s; 3,072 at 1 gave 43.5 s and 111.2 s but paused the other reply for 43 s). The preset enables retained-cache relocation and keeps draft borrowing, sliced prefill and NVMe prompt caching off (`DISK_CACHE=1` turns the NVMe cache on; see below). Admission uses a 16 GiB reserve, including a 6 GiB free-memory target. The runtime guard stops a rank below 3 GiB.
 
 The preset also sets (2026-11-22; each can be overridden from the environment):
 
@@ -10,7 +10,7 @@ The preset also sets (2026-11-22; each can be overridden from the environment):
 
 ## Run on the head Spark
 
-Use the usual worker and NFS settings in `scripts/local.sh` or `.env`. Build the image from this recipe's patches (0143 adds the dual-slot scheduler features; 0144-0146 the counters, the tool-call parser fix and the wider verify window; the check refuses an image without 0146) with `IMAGE=tensorfold-glm53-full:dual-128k-fp4 PULL=0 ./scripts/prepare.sh` (about the same steps as the main recipe; see the README).
+Use the usual worker and NFS settings in `scripts/local.sh` or `.env`. Build the image from this recipe's patches (0143 adds the dual-slot scheduler features; 0144-0146 the counters, the tool-call parser fix and the wider verify window; 0147 the NVMe prompt cache for two slots; the check refuses an image without 0146, and with `DISK_CACHE=1` one without 0147) with `IMAGE=tensorfold-glm53-full:dual-128k-fp4 PULL=0 ./scripts/prepare.sh` (about the same steps as the main recipe; see the README).
 
 ```bash
 export IMAGE=tensorfold-glm53-full:dual-128k-fp4
@@ -47,6 +47,29 @@ Not changed, with the reason:
 - `KV=fp4x`: only needed for a third 128k slot (see above). On the README's quality suite it was not significantly worse than FP4, but leaned toward FP4 on ledger tracking.
 - Keeping a waiting agent's cache: the scheduler already does this. Kept prompts stay in the pool, and eviction drops a conversation's earlier turns before the only state of a conversation that waits on a tool (`cap_victim`). More entries (above) were the missing piece.
 - Suffix-style drafting: copy drafts already propose up to 15 tokens from matching text in the prompt (8+ tokens) and the reply (24+), checked by DSpark. The wider window lets them run longer under two streams.
+
+## NVMe prompt cache with two slots (0147, `DISK_CACHE=1`)
+
+Before 0147 the NVMe prompt cache (`TF_GLM_DISK_CACHE`, patch 0132) worked only with one request at a time. With two slots, a prompt that left the pool (evicted to make room, or lost in a restart) had to be read again: a 96k prompt took 168 s. Patch 0147 adds the disk tier to the two-slot scheduler:
+
+- **Write.** When the scheduler keeps a prompt state, each Spark writes its own part of it (the prompt's cache rows and the DSpark window) to its own NVMe, in the background. The rows are read straight from the pool, so no extra GPU memory is used. If the scheduler moves the state in the pool while the write runs, the write starts again from the new place. If it evicts the state, it first waits for the write to end (up to `TF_GLM_DISK_EVICT_WAIT_S`, 10 s).
+- **Load.** When a new request finds a longer saved prefix on disk than in memory, rank 0 reserves a pool extent and tells all ranks to load the state (new scheduler op `DISK`). Each rank reads and checks its own file. Only if all three ranks have a good file does the state become a kept prompt; the request then continues from it like from any other kept prompt. Otherwise every rank deletes its file and the request reads its prompt as usual.
+- **Same replies.** A loaded state has exactly the bytes that were saved (every 16 MiB piece is checksummed), so replies stay equal to their serial references. Images are not cached on disk (their token ids do not identify their rows).
+
+Turn it on with `DISK_CACHE=1 ./scripts/dual-128k-fp4.sh restart` (the preset keeps it off by default; the image check then also requires 0147). Files live in `KERNEL_CACHE/<image hash>/pcache` on each Spark, up to `DISK_CACHE_GIB` (64) per Spark. `/health` shows a `disk_cache` block (states, GiB, written, hits, misses, cancelled, fenced). It costs about 0.25 GiB of pinned host memory per Spark (staging buffers).
+
+Measured 2026-11-22 on image `v0.6.0-dual-0147-2ee4b9cabd28` (0146 + 0147) with `DISK_CACHE=1`, a 91,921-token prose prompt, greedy, 48 reply tokens:
+
+| Case | Prompt time | Whole request | Reply |
+|---|---|---|---|
+| Cold (nothing cached) | 157.4 s prefill | 160.7 s | reference |
+| After eviction (28 other prompts pushed it out of the 24 kept prompts) | 0.54 s disk load | 2.4 s | same token hash |
+| After a server restart | 0.55 s disk load | 2.6 s | same token hash |
+
+- The state is 3.38 GiB per Spark; it loads at about 6.5 GB/s per Spark (O_DIRECT, no page cache). The write runs in the background while the reply decodes; this one was restarted once (the stream moved to its one-stream position in the pool) and was on disk about 20 s after the reply.
+- `tools/exact.py`: 12/12 replies equal their serial references.
+- Lowest free memory during the test: 11.1 / 12.2 / 11.5 GiB (ranks 0/1/2), the same range as without the disk tier.
+- CPU tests: `tests/cpu/test_full_multi_disk.py` (restart and eviction reloads with DSpark, a write restarted after an extent move, three ranks where one rank lost its file), plus the existing multi-stream and prompt-cache tests.
 
 ## Hermes Agent with two slots
 
