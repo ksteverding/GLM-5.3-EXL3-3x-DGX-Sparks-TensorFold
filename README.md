@@ -1,5 +1,14 @@
 > [!IMPORTANT]
 > **This is a fork.** This repository is a modified copy of [MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold) (commit `eb6414b`), the original work of Mia's AI Lab and its contributors. It is not maintained or endorsed by them. The README below is the original, unchanged. For what this fork adds or changes, see [`CHANGES-FROM-UPSTREAM.md`](CHANGES-FROM-UPSTREAM.md). Report problems with the fork's additions here, not upstream.
+>
+> **What this fork adds** (details and measurements in [`docs/dual-128k-fp4.md`](docs/dual-128k-fp4.md)):
+>
+> - `scripts/dual-128k-fp4.sh`: a preset for two parallel requests with 131,072 tokens each (FP4 KV cache, Q4 dense weights, DSpark drafter). It gives 28.3 tok/s for one request and 37.7 tok/s in total for two.
+> - The NVMe prompt cache now works with two parallel requests too (patch 0147, `DISK_CACHE=1`). A 92k-token prompt that left memory, or was lost in a restart, loads again in 0.55 s instead of being read again in 157 s.
+> - A fix for agent clients (patch 0145): a `<tool_call>` the model mentions in its reasoning or answer no longer hides the real tool call after it, which used to end agent tasks early.
+> - Wider verify windows for parallel requests (patch 0146) and more kept prompts, so a shared system prompt stays cached during bursts.
+> - Optional counters of which experts each layer uses, for pruning and quantization research (patch 0144). Counts only, no request text.
+> - A setup guide for Hermes Agent with two slots (subagents at background priority).
 
 <h1 align="center">GLM-5.3 EXL3 on DGX Sparks with TensorFold</h1>
 
