@@ -1,0 +1,64 @@
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -17,6 +17,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ from typing import Any, Sequence
+ 
+@@ -292,12 +293,27 @@
+         self.segments = []
+ 
+ 
+-# full GLM-5.3: the rows a batched window takes at most. Up to 16 rows every row-independent kernel keeps the tile it
+-# runs a lone stream's window on (qmm's 16-row bucket, the absorb's one row a program, 16-head attention tiles), so
+-# the bits cannot move with the window's size; past it the tiles change (claimed bit-neutral, unproven on the GPU).
+-FULL_MAX_ROWS = 16
++def full_max_rows(value: str | None = None) -> int:
++    """TF_GLM_MULTI_ROWS: the rows full GLM-5.3's batched verify takes at most a round, every stream's window together,
++    16 (default) to TF_GLM_MAX_ROWS in steps of 8. Up to 16 rows every row-independent kernel keeps the tile it runs a
++    lone stream's window on (qmm's 16-row bucket, the absorb's one row a program, 16-head attention tiles), so the bits
++    cannot move with the window's size; past it the tiles change (tools/exact.py checks that replies still equal their
++    serial references). Past 16 rows the all-gathers also need TF_ROCE_MAX_KB raised (16 KiB a row) to stay on RoCE."""
++
++    from .engine import MAX_ROWS
+ 
++    value = (os.environ.get("TF_GLM_MULTI_ROWS", "") if value is None else value).strip()
++    if value == "":
++        return 16
++    if not value.isdecimal() or not 16 <= int(value) <= MAX_ROWS or int(value) % 8:
++        raise ValueError(f"TF_GLM_MULTI_ROWS: 16 to TF_GLM_MAX_ROWS ({MAX_ROWS}) in steps of 8, not {value!r}")
++    return int(value)
+ 
++
++# full GLM-5.3: the rows a batched window takes at most (TF_GLM_MULTI_ROWS)
++FULL_MAX_ROWS = full_max_rows()
++
++
+ class FullBatchedVerify:
+     """Full GLM-5.3's batched verify: ONE eager forward over every segment's rows back to back (``forward.compute``
+     with a ``mixer``), each segment a stream's window on its own ``State`` (its extent of the shared ``Caches``, its
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -36,7 +36,7 @@
+ (TF_GLM_MULTI_VERIFY) by ``full_seg.FullSegVerify`` (seg, the default: one forward, each layer's attention on every
+ stream's rows in one launch a piece, a CUDA graph a (rows, token bucket) replayed when the window's shape has one,
+ TF_GLM_MULTI_GRAPHS), ``verify.FullBatchedVerify`` (segments: one eager forward, each segment's attention a call on
+-its own stream's caches) or ``SerialVerify``; every round's windows together at most ``verify.FULL_MAX_ROWS`` (16)
++its own stream's caches) or ``SerialVerify``; every round's windows together at most ``verify.FULL_MAX_ROWS`` (16, TF_GLM_MULTI_ROWS)
+ rows, so each stream drafts at most its share (16 // streams - 1) and ``trim`` cuts the rest; DSpark drafts
+ (``dspark_multi.DSparkMulti``: a context a stream over one weight set, proposals one stream after another, up to the
+ speculator's 8 drafts, each context's block pass and updates as CUDA graphs; auto requests take
+@@ -1607,7 +1607,7 @@
+         copied: list[bool] = []
+         asks = []
+         # full GLM-5.3: every stream's window in one batched verify of at most FULL_MAX_ROWS rows, so each stream drafts
+-        # at most its share (2 streams: 7, 3: 4, 4: 3); ``trim`` still cuts copied drafts to the round's rows
++        # at most its share (16 rows: 2 streams 7, 3: 4, 4: 3; 24 rows: 11, 7, 5); ``trim`` still cuts copied drafts
+         share = max(0, self.window_rows // max(1, len(lanes)) - 1) if self.full else None
+         borrow = self.borrow if len(lanes) > 1 and not short else None
+         for l in lanes:

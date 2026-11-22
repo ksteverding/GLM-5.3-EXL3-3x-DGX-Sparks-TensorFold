@@ -1,0 +1,103 @@
+diff --git tensorfold/cuda/reply_text.py tensorfold/cuda/reply_text.py
+--- tensorfold/cuda/reply_text.py
++++ tensorfold/cuda/reply_text.py
+@@ -16,7 +16,10 @@
+ from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
++# a block's name part (before its first <arg_key>) holds no other <tool_call> and no </think>: an opener the model wrote as
++# text (a mention, in its reasoning or answer) is not a call, and the next opener is read instead of being swallowed
++_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*((?:(?!<tool_call>|</think>|<arg_key>).)*?(?:<arg_key>.*?)?)\s*</tool_call>",
++                                 re.IGNORECASE | re.DOTALL)
+ _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
+ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
+ 
+@@ -80,6 +83,17 @@
+         return StopPolicy.visible(self, text, partial=partial)
+ 
+ 
++def _stray_open(text: str, start: int) -> int:
++    """Where the ``<tool_call>`` at ``start`` turns out to be text: the next ``<tool_call>`` or ``</think>`` in its name
++    part (before its first ``<arg_key>`` and its ``</tool_call>``), else -1. An argument's value may hold either."""
++
++    body = start + len(_CALL_OPEN)
++    ends = [at for at in (text.find("<arg_key>", body), text.find(_CALL_CLOSE, body)) if at >= 0]
++    name_end = min(ends) if ends else len(text)
++    found = [at for at in (text.find(_CALL_OPEN, body, name_end), text.find(_THINK_CLOSE, body, name_end)) if at >= 0]
++    return min(found) if found else -1
++
++
+ def hide_tool_calls(text: str, *, finished: bool) -> str:
+     out: list[str] = []
+     pos = 0
+@@ -90,6 +104,10 @@
+             out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+             return "".join(out)
+         out.append(text[pos:start])
++        if (stray := _stray_open(text, start)) >= 0:      # a mention, shown as text
++            out.append(text[start:stray])
++            pos = stray
++            continue
+         end = text.find(_CALL_CLOSE, start)
+         if end < 0:
+             return "".join(out)
+@@ -161,6 +179,26 @@
+ 
+ _THINK_CLOSE = "</think>"
+ _CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
++
++
++def _call_block(text: str, pos: int) -> int:
++    """The end of the whole call block at ``pos``, or -1 (none, or an opener written as text: ``_stray_open``)."""
++
++    block = _CALL_BLOCK.match(text, pos)
++    return block.end() if block is not None and _stray_open(text, pos) < 0 else -1
++
++
++def _maybe_call(text: str, at: int) -> bool:
++    """Whether the unclosed ``<tool_call>`` at ``at`` may still be a GLM call being written: its name part so far is
++    a name (an opener followed by words is text the model wrote, held neither as a call nor out of the reasoning)."""
++
++    body = at + len(_CALL_OPEN)
++    ends = [end for end in (text.find("<arg_key>", body), text.find(_CALL_CLOSE, body)) if end >= 0]
++    name = text[body:min(ends)] if ends else text[body:]
++    if not ends:                                # less a tail that may begin <arg_key> or </tool_call>
++        name = name[:len(name) - max(_partial_tag(name, "<arg_key>"), _partial_tag(name, _CALL_CLOSE))]
++    name = name.strip()
++    return _stray_open(text, at) < 0 and (not name or _GLM_NAME.fullmatch(name) is not None)
+ THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
+ _GLM_TAG = re.compile(r"</?arg_(?:key|value)>")
+ _LAST_WORD = re.compile(r"(\S+)\s*$")
+@@ -209,16 +247,16 @@
+     come true, ``"reasoning"`` once text follows it (more reasoning, or an answer after the think block)."""
+ 
+     end = pos = start
+-    while (block := _CALL_BLOCK.match(text, pos)) is not None:
+-        end = block.end()
++    while (block := _call_block(text, pos)) >= 0:
++        end = block
+         pos = len(text) - len(text[end:].lstrip())
+     after = text[end:].lstrip()
+     if after.startswith(_THINK_CLOSE) and not after[len(_THINK_CLOSE):].strip():
+         after = ""
+     if not after:
+         return end, "calls" if finished and end > start else "pending"
+-    if not finished and (after.startswith(_CALL_OPEN) or _CALL_OPEN.startswith(after)
+-                         or _THINK_CLOSE.startswith(after)):
++    if not finished and ((after.startswith(_CALL_OPEN) and _maybe_call(text, len(text) - len(after)))
++                         or _CALL_OPEN.startswith(after) or _THINK_CLOSE.startswith(after)):
+         return end, "pending"                   # a block, or the think block's close, being written
+     return end, "reasoning"
+ 
+@@ -328,6 +366,10 @@
+                 self.pos, self.state = self.start + len(_CALL_OPEN), "name"
+             elif self.state == "name":                  # the end parser's name: the text before <arg_key> or the end
+                 ends = [at for at in (rest.find(_KEY), rest.find(_CALL_CLOSE)) if at >= 0]
++                again = rest.find(_CALL_OPEN, 0, min(ends) if ends else len(rest))
++                if again >= 0:                          # the opener was text (a mention): follow the next one
++                    self.pos, self.state = self.pos + again, "outside"
++                    continue
+                 if not ends:
+                     if len(rest) > 256:
+                         self.state = "skip"

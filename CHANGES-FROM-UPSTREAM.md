@@ -12,6 +12,10 @@ This repository is a fork: a modified copy of [MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Spa
   - optional borrowing of spare draft rows between streams (`TF_GLM_MULTI_DRAFT_BORROW`);
   - optional moving of kept prompt caches so a lone stream can use its faster graphs (`TF_GLM_MULTI_KEEP_HOME_CACHE`);
   - new `/health` counters for these features.
+- `patches/0144-glm-full-expert-counts.patch`: optional counters of which routed experts each layer picks (`TF_GLM_EXPERT_COUNTS=1`), written as totals and hourly snapshots. Counts only, no request text.
+- `patches/0145-glm-tool-call-stray-tags.patch`: a `<tool_call>` the model writes as text (a mention in its reasoning or answer) no longer swallows the real tool call after it. Before, the reply came back as plain text with the raw call inside and finish reason `stop`, so agent clients ended the task.
+- `patches/0146-glm-full-multi-rows.patch`: `TF_GLM_MULTI_ROWS` sets the parallel verify window (16 by default, up to `TF_GLM_MAX_ROWS`).
+- `tests/cpu/test_expert_counts.py`, `tests/cpu/test_tool_call_stray_tags.py`: CPU tests for 0144 and 0145.
 - `.gitignore` for the machine-local settings files.
 
 ## Modified

@@ -1,0 +1,266 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 1c00261..6b8675e 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -1037,6 +1037,8 @@ class GlmEngine:
+                 print(f"[tensorfold] context parallelism: prompt chunks gather raw queries; the other ranks' absorb "
+                       f"rows kept here ({kept / 2 ** 30:.2f} GiB, TF_GLM_CP_RAW_Q)", flush=True)
+         self.w = w
++        from . import expert_counts                  # TF_GLM_EXPERT_COUNTS: before any graph capture
++        expert_counts.setup(w, rank)
+         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
+             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
+                   (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
+diff --git tensorfold/families/glm5_next/cuda/expert_counts.py tensorfold/families/glm5_next/cuda/expert_counts.py
+new file mode 100644
+index 0000000..112bd0b
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/expert_counts.py
+@@ -0,0 +1,176 @@
++"""Routed-expert usage counters for full GLM-5.3 (TF_GLM_EXPERT_COUNTS=1, off by default; rank 0 only).
++
++Each MoE layer's router picks ``top_k`` experts and weights per row (``b.pick`` / ``b.wts``). With the counters on,
++rank 0 adds every row's picks to a table [phase, class, layer, expert]: how often an expert was picked (``count``) and
++the sum of its router weights (``weight``). Phases: 0 prompt rows (prompt chunks), 1 reply rows (decode verify
++windows: the pending token and its drafts, accepted or not). Classes: 0 foreground, 1 background requests
++(``"priority": "background"``). Only expert ids, weights and row totals are stored: no token ids, no text.
++
++The adds are three device ops a layer with fixed addresses, so the captured decode graphs carry them: no host sync and
++no allocation inside a forward. The model's outputs do not read the counters, so every reply keeps its bits.
++
++Files (``TF_GLM_EXPERT_COUNTS_DIR``, default ``/cache/expert-counts``: the head's kernel cache mount):
++  totals.npz                 the running totals since the first start, rewritten every TF_GLM_EXPERT_COUNTS_EVERY_S (300)
++  hourly/<UTC time>.npz      a copy of the totals once an hour (TF_GLM_EXPERT_COUNTS_SNAPSHOT_S, 3600)
++Each file holds ``count`` and ``weight`` [2, 2, layers, experts] (float64), ``rows`` [2, 2] (rows counted),
++``layers``, ``experts``, ``top_k``, ``started`` and ``saved`` (Unix seconds) and ``image`` (TF_GLM_EXPERT_COUNTS_TAG).
++A restart continues from totals.npz when its shape matches."""
++
++from __future__ import annotations
++
++import os
++import time
++from pathlib import Path
++
++import numpy as np
++import torch
++
++ON: "ExpertCounts | None" = None          # set by ``setup`` on rank 0 when TF_GLM_EXPERT_COUNTS=1
++
++ROWS = 16384 + 64                         # the largest window counted (prompt chunks up to TF_GLM_PREFILL_ROWS 16,384)
++
++
++def enabled() -> bool:
++    return os.environ.get("TF_GLM_EXPERT_COUNTS", "0").strip() == "1"
++
++
++def setup(w, rank: int) -> None:
++    """Engine start, before any graph capture: rank 0's buffers (~3 MiB) and the totals of an earlier run."""
++
++    global ON
++    if rank != 0 or not enabled() or not w.cfg.full:
++        return
++    first = min((l.index for l in w.layers if getattr(l, "mlp", None) is None), default=0)
++    ON = ExpertCounts(int(w.cfg.layers), int(w.cfg.experts), int(w.cfg.top_k), w.device, first)
++    print(f"[tensorfold] expert counters on: {ON.L} layers x {ON.E} experts, top {ON.K}; files in {ON.dir} "
++          f"(TF_GLM_EXPERT_COUNTS)", flush=True)
++
++
++class ExpertCounts:
++    def __init__(self, layers: int, experts: int, top_k: int, device, first_moe: int = 0) -> None:
++        self.L, self.E, self.K = layers, experts, top_k
++        self.first_moe = first_moe              # the first MoE layer: counts each forward's rows once
++        self.cells = 2 * 2 * layers * experts
++        f32, i64 = torch.float32, torch.int64
++        self.count = torch.zeros((self.cells,), dtype=f32, device=device)
++        self.weight = torch.zeros((self.cells,), dtype=f32, device=device)
++        self.rows_dev = torch.zeros((4,), dtype=f32, device=device)
++        self.idx = torch.zeros((ROWS * top_k,), dtype=i64, device=device)
++        self.wv = torch.zeros((ROWS * top_k,), dtype=f32, device=device)
++        self.ones = torch.ones((ROWS * top_k,), dtype=f32, device=device)
++        self.row_one = torch.ones((ROWS,), dtype=f32, device=device)
++        # each row's class offset (0 or layers * experts) and its class index (0 or 1), set on the host before a
++        # forward by ``classes``; the captured graphs read them like any other device table
++        self.rowoff = torch.zeros((ROWS,), dtype=i64, device=device)
++        self.rowcls = torch.zeros((ROWS,), dtype=i64, device=device)
++        self.pattern: tuple = ()
++        self.dir = Path(os.environ.get("TF_GLM_EXPERT_COUNTS_DIR", "/cache/expert-counts"))
++        self.every = float(os.environ.get("TF_GLM_EXPERT_COUNTS_EVERY_S", "300"))
++        self.snapshot_every = float(os.environ.get("TF_GLM_EXPERT_COUNTS_SNAPSHOT_S", "3600"))
++        self.tag = os.environ.get("TF_GLM_EXPERT_COUNTS_TAG", "")
++        shape = (2, 2, layers, experts)
++        self.total_count = np.zeros(shape, dtype=np.float64)
++        self.total_weight = np.zeros(shape, dtype=np.float64)
++        self.total_rows = np.zeros((2, 2), dtype=np.float64)
++        self.started = time.time()
++        self._load()
++        now = time.monotonic()
++        self.last_save, self.last_snapshot = now, now
++        self.armed = False                       # set by the scheduler's first ``tick``
++
++    def _load(self) -> None:
++        f = self.dir / "totals.npz"
++        if not f.exists():
++            return
++        try:
++            with np.load(f) as z:
++                if z["count"].shape == self.total_count.shape:
++                    self.total_count += z["count"]
++                    self.total_weight += z["weight"]
++                    self.total_rows += z["rows"]
++                    self.started = float(z["started"])
++                else:
++                    print(f"[tensorfold] expert counters: {f} has another shape; starting new totals", flush=True)
++        except Exception as e:                   # a damaged file must not stop the server
++            print(f"[tensorfold] expert counters: cannot read {f} ({e}); starting new totals", flush=True)
++
++    # ------------------------------------------------------------------ device side (inside forwards and graphs)
++    def add(self, layer: int, pick: torch.Tensor, wts: torch.Tensor, R: int, prefill: bool) -> None:
++        """A layer's picks of rows 0 .. R: pick [rows, top_k + 1] int32 (the last slot is the shared expert),
++        wts [rows, top_k + 1] fp32. ``layer`` past the model's layers (the MTP layer) is not counted."""
++
++        if layer >= self.L or R < 1 or R > ROWS:
++            return
++        K, n = self.K, R * self.K
++        phase = 0 if prefill else 1
++        idx = self.idx[:n].view(R, K)
++        torch.add(pick[:R, :K], self.rowoff[:R].unsqueeze(1), out=idx)         # int32 + int64 -> int64
++        idx.add_((phase * 2 * self.L + layer) * self.E)
++        self.count.index_add_(0, self.idx[:n], self.ones[:n])
++        self.wv[:n].view(R, K).copy_(wts[:R, :K])
++        self.weight.index_add_(0, self.idx[:n], self.wv[:n])
++        if layer == self.first_moe:             # rows a phase and class counted, once a forward
++            torch.add(self.rowcls[:R], 2 * phase, out=self.idx[:R])
++            self.rows_dev.index_add_(0, self.idx[:R], self.row_one[:R])
++
++    # ------------------------------------------------------------------ host side (between forwards)
++    def classes(self, spans) -> None:
++        """Rows of the next forward(s): ``spans`` = [(rows, background), ...] back to back from row 0. Writes the
++        device tables only when the pattern changes (a few fill launches, no host sync)."""
++
++        pattern = tuple((int(n), bool(bg)) for n, bg in spans)
++        if pattern == self.pattern:
++            return
++        at = 0
++        for n, bg in pattern:
++            if at + n > ROWS:
++                break
++            self.rowoff[at:at + n].fill_(self.L * self.E if bg else 0)
++            self.rowcls[at:at + n].fill_(1 if bg else 0)
++            at += n
++        self.pattern = pattern
++
++    def tick(self) -> None:
++        """Rank 0's scheduler, once an iteration: every ``every`` seconds the device counts move into the float64
++        totals (one small copy, then the device counters restart at zero) and totals.npz is rewritten; once an hour a
++        snapshot."""
++
++        now = time.monotonic()
++        if not self.armed:
++            # the first iteration: drop what startup counted (graph warm-ups, timed verify windows, calibration)
++            self.count.zero_()
++            self.weight.zero_()
++            self.rows_dev.zero_()
++            self.armed = True
++            self.last_save = self.last_snapshot = now
++            return
++        if now - self.last_save < self.every:
++            return
++        self.last_save = now
++        try:
++            self.flush()
++            self._write(self.dir / "totals.npz")
++            if now - self.last_snapshot >= self.snapshot_every:
++                self.last_snapshot = now
++                stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
++                self._write(self.dir / "hourly" / f"{stamp}.npz")
++        except Exception as e:                   # a full disk must not stop the server
++            print(f"[tensorfold] expert counters: save failed ({e})", flush=True)
++
++    def flush(self) -> None:
++        shape = self.total_count.shape
++        self.total_count += self.count.view(shape).double().cpu().numpy()
++        self.total_weight += self.weight.view(shape).double().cpu().numpy()
++        self.total_rows += self.rows_dev.view(2, 2).double().cpu().numpy()
++        self.count.zero_()
++        self.weight.zero_()
++        self.rows_dev.zero_()
++
++    def _write(self, path: Path) -> None:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_name(path.name + ".tmp")
++        with open(tmp, "wb") as f:
++            np.savez_compressed(f, count=self.total_count, weight=self.total_weight, rows=self.total_rows,
++                                layers=self.L, experts=self.E, top_k=self.K, started=self.started,
++                                saved=time.time(), image=self.tag)
++        os.replace(tmp, path)
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 181c2a7..f21515e 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -13,7 +13,7 @@ from tensorfold.cuda import experts as grouped
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
++from . import expert_counts, glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -1606,6 +1606,8 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+     with prof.timed("moe: route"):
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
++        if expert_counts.ON is not None:         # TF_GLM_EXPERT_COUNTS: rank 0's usage table (reads only)
++            expert_counts.ON.add(layer.index, b.pick, b.wts, R, b.prefill)
+     slots = c.top_k + 1
+ 
+     if b.prefill and R <= EXL3_BLOCK_ROWS and MOE_OVERLAP and b.split is not None and b.split.active:
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index bcc3957..78c0bc9 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -59,7 +59,7 @@ import torch
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill, sliced_fill
++from . import expert_counts, multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import FULL_MAX_ROWS, BatchedVerify, FullBatchedVerify, Segment, SerialVerify, Verified
+@@ -1209,6 +1209,8 @@ class MultiDecoder:
+         return lane
+ 
+     def _iterate(self) -> list[Stream]:
++        if expert_counts.ON is not None:         # rank 0: the counters' periodic save (TF_GLM_EXPERT_COUNTS)
++            expert_counts.ON.tick()
+         if self.fill_budget or (self.full and self.group):
+             cancelled = []
+             for lane in self.lanes.values():
+@@ -1474,6 +1476,8 @@ class MultiDecoder:
+         replay = lane.head is not None           # resumed at the prompt's end: no rows, the kept head's row
+         if not (start < stop <= n or replay and start == stop == n) or stop - start > e.prefill_rows:
+             raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
++        if expert_counts.ON is not None:
++            expert_counts.ON.classes([(stop - start, s.background)])
+         t = time.perf_counter()
+         prev = e.use(lane.st)
+         try:
+@@ -1541,6 +1545,8 @@ class MultiDecoder:
+                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                               drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
++        if expert_counts.ON is not None:         # the pieces run back to back in this order (multi_prefill.layout)
++            expert_counts.ON.classes([(stop - lane.st.pos, lane.s.background) for lane, stop in group])
+         t = time.perf_counter()
+         if layers is None:
+             heads = multi_prefill.prefill_pieces(e, pieces)
+@@ -1646,6 +1652,8 @@ class MultiDecoder:
+                 raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
+             if len(segments[0].tokens) <= self.lone_rows:
+                 verify = self.solo_verify
++        if expert_counts.ON is not None:         # the window's rows: each segment's, in order
++            expert_counts.ON.classes([(len(seg.tokens), l.s.background) for l, seg in zip(lanes, segments)])
+         if prof is not None:
+             prof.gpu_start()
+         v = forward_streams(verify, segments)
