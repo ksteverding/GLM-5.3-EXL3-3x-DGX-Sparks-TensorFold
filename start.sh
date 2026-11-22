@@ -29,6 +29,7 @@
 #            NCCL_DEBUG
 #   files    MODEL_ID, MODEL_REVISION, HF_CACHE, NFS_PATH, NFS_SERVER, NFS_SERVER2, NFS_VOLUME, KERNEL_CACHE,
 #            STATE_DIR, LOG_DIR, LOG_KEEP, HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default: the local cache)
+#            EXPERT_COUNTS_DIR (rank 0's expert counts, 0144, in this host folder instead of the image's cache)
 #   image    IMAGE, TF_VERSION, TF_REPO, BASE_IMAGE, FLASH_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), KEEP_FREE_GB, IMAGE_FREE_GB; WAIT_TIMEOUT (seconds, 2400); DRY_RUN=1;
 #            FOREGROUND=1 (stay attached to rank 0's log, exit with its code); STOP_TIMEOUT (stop.sh)
@@ -323,7 +324,15 @@ launch() {
   rank0=(tensorfold serve "$MODEL_ARG" --tp 3 --rank 0 --master "$MASTER_ADDR" --master-port "$MASTER_PORT"
          --name "$SERVED_NAME" --host "$HOST" --port "$PORT" "${SERVE_ARGS[@]}")
   log "Rank 0 here: ${rank0[*]}"
-  here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}"
+  # expert counts (0144; only rank 0 writes them): a host folder that outlives image rebuilds, each file tagged with
+  # the image that counted it
+  local head_args=()
+  if [[ -n "${EXPERT_COUNTS_DIR:-}" ]]; then
+    (( DRY )) || mkdir -p "$EXPERT_COUNTS_DIR"
+    head_args=(-v "$EXPERT_COUNTS_DIR":/expert-counts -e TF_GLM_EXPERT_COUNTS_DIR=/expert-counts
+               -e "TF_GLM_EXPERT_COUNTS_TAG=${TF_GLM_EXPERT_COUNTS_TAG:-$IMAGE}")
+  fi
+  here_cmd=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS[@]}" "${ENV_ARGS[@]}" "${head_args[@]}"
             $(rank_nccl_env 0)
             -v "$HF_CACHE":/root/.cache/huggingface:ro -v "$KERNEL_CACHE/$KCACHE":/cache
             "$IMAGE" "${rank0[@]}")

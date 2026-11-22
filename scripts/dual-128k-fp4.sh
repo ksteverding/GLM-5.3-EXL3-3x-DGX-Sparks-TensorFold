@@ -34,6 +34,8 @@ export TF_GLM_MAX_ROWS=${TF_GLM_MAX_ROWS:-24} TF_GLM_MULTI_ROWS=${TF_GLM_MULTI_R
 export TF_GLM_CACHE_ENTRIES=${TF_GLM_CACHE_ENTRIES:-24}
 # Expert usage counters (0144), for the own-quantization work; TF_GLM_EXPERT_COUNTS=0 turns them off
 export TF_GLM_EXPERT_COUNTS=${TF_GLM_EXPERT_COUNTS:-1}
+# ... written to the head's state folder, so the totals survive image rebuilds (EXPERT_COUNTS_DIR= keeps them per image)
+export EXPERT_COUNTS_DIR=${EXPERT_COUNTS_DIR-$STATE_DIR/expert-counts}
 # DISK_CACHE=1: kept prompts also on each Spark's NVMe (0147), so an evicted or restart-lost prompt loads in seconds
 
 check_image() (

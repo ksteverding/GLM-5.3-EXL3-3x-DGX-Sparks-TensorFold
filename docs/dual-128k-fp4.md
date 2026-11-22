@@ -6,7 +6,7 @@ The preset also sets (2026-11-22; each can be overridden from the environment):
 
 - `TF_GLM_MAX_ROWS=24` and `TF_GLM_MULTI_ROWS=24` (0146): verify windows of up to 24 rows, for one stream and for both streams together (16 before; with two streams each one drafted at most 7 tokens, now 11). Copy drafts can run longer. `TF_ROCE_MAX_KB=512` keeps these larger all-gathers on RoCE (16 KiB a row) instead of NCCL. `tools/exact.py` gave 12/12: replies still equal their serial references.
 - `TF_GLM_CACHE_ENTRIES=24` (8 before): more kept prompts. With 8, one burst of other requests pushed out a shared system prompt, and the next agent turn read 19k tokens again (40-70 s instead of under 1 s). Costs about 6k tokens of the pool (266,240 instead of 272,384).
-- `TF_GLM_EXPERT_COUNTS=1` (0144): counts which routed experts each layer uses, for pruning and quantization research. No measurable speed cost.
+- `TF_GLM_EXPERT_COUNTS=1` (0144): counts which routed experts each layer uses, for pruning and quantization research. No measurable speed cost. The head writes the counts to `~/.local/state/glm53-full-tensorfold-dual-128k-fp4/expert-counts` (`EXPERT_COUNTS_DIR`), so the totals survive image rebuilds; each file records the image that counted it. Send benchmark and test requests with `"priority": "background"`, so they are counted apart from real use.
 
 ## Run on the head Spark
 
